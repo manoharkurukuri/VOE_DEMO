@@ -1,0 +1,17 @@
+numpy
+pandas
+openpyxl
+fastapi
+uvicorn
+pydantic
+pydantic-ai
+pydantic-settings
+logfire
+beautifulsoup4>=4.12
+langgraph>=1.0
+langchain-core>=1.0
+langchain-groq>=1.1
+langchain-openai>=0.2
+python-dotenv>=1.0
+requests>=2.32
+playwright>=1.50

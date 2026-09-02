@@ -1,0 +1,19 @@
+# Environment
+.env
+.env.*
+
+# Storage
+storage/
+
+venv/
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDEs
+.vscode/
+.idea/
+.idea/*
+.idea/*.*

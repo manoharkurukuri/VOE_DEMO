@@ -1,0 +1,401 @@
+import re
+import zipfile
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import logfire
+import pandas as pd
+
+from app.core.config import settings
+from app.core.exceptions import FileStorageError
+from app.schemas.offer import DealerZipResult, GenerateOffersResult
+from app.service.excel_service import ExcelService
+from app.workflows.offer_generation_graph import OfferGenerationWorkflow
+
+SALES_SPECIALS_TYPE = "Sales Specials"
+REQUIRED_COLUMNS = {"id", "DealerName", "oem", "type", "url"}
+
+
+@dataclass
+class _UrlResult:
+    """Outcome of scraping + extracting a single dealer/OEM URL."""
+
+    order: int
+    dealer_id: str
+    dealer_name: str
+    oem: str
+    url: str
+    count: int
+    file_name: str | None = None
+    file_bytes: bytes | None = None
+    error_message: str | None = None
+
+
+class OfferGenerationService:
+    """Reads a dealer-URL workbook, extracts Sales Specials offers per OEM, and
+    packages each dealer's generated Excel files into a single zip."""
+
+    def __init__(self) -> None:
+        self.timezone_name = settings.app_timezone
+        self.storage_dir = Path(settings.local_storage_dir)
+        self.excel_service = ExcelService()
+        self.workflow = OfferGenerationWorkflow(excel_service=self.excel_service)
+
+    @staticmethod
+    def _slugify(value: str) -> str:
+        value = str(value).strip().lower()
+        value = re.sub(r"[^a-z0-9]+", "_", value)
+        return value.strip("_") or "dealer"
+
+    def _date_token(self) -> str:
+        return datetime.now(ZoneInfo(self.timezone_name)).strftime("%Y%m%d")
+
+    def generate_from_excel(self, excel_path: str | Path) -> GenerateOffersResult:
+        """Synchronous end-to-end run (used by the CLI): scrape every dealer URL,
+        then extract + zip each dealer, dealers processed in parallel."""
+        source_file, payloads = self.scrape_dealers(excel_path)
+
+        dealers: list[DealerZipResult | None] = [None] * len(payloads)
+        if payloads:
+            workers = max(1, min(settings.dealer_extract_workers, len(payloads)))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(self.build_dealer, payload): index
+                    for index, payload in enumerate(payloads)
+                }
+                for future in as_completed(futures):
+                    dealers[futures[future]] = future.result()
+
+        return GenerateOffersResult(
+            source_file=source_file,
+            dealers=[dealer for dealer in dealers if dealer is not None],
+        )
+
+    def scrape_dealers(
+        self,
+        excel_path: str | Path,
+        on_dealer_ready: Callable[[dict[str, Any]], None] | None = None,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Stage B: read the workbook, scrape every Sales Specials URL in parallel,
+        and return one scraped-data payload per dealer (id, name, per-URL bodies).
+
+        If ``on_dealer_ready`` is given, it is called with a dealer's payload the
+        moment that dealer's URLs finish scraping, so extraction (stage C) can start
+        while the remaining dealers are still being scraped.
+        """
+        excel_path = Path(excel_path)
+        df = pd.read_excel(excel_path)
+
+        missing = REQUIRED_COLUMNS - set(df.columns)
+        if missing:
+            raise FileStorageError(
+                f"Input workbook is missing required columns: {sorted(missing)}"
+            )
+
+        sales_specials = df[df["type"] == SALES_SPECIALS_TYPE]
+        logfire.info(
+            "Filtered Sales Specials rows",
+            source_file=str(excel_path),
+            total_rows=len(df),
+            sales_specials_rows=len(sales_specials),
+        )
+
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        date_token = self._date_token()
+
+        rows: list[tuple[int, str, str, str, str, str]] = []
+        dealer_order: list[tuple[str, str]] = []
+        remaining: dict[tuple[str, str], int] = {}
+        for index, row in enumerate(sales_specials.itertuples(index=False)):
+            dealer_id = str(row.id)
+            dealer_name = str(row.DealerName)
+            key = (dealer_id, dealer_name)
+            if key not in remaining:
+                dealer_order.append(key)
+                remaining[key] = 0
+            remaining[key] += 1
+            rows.append(
+                (index, dealer_id, dealer_name, str(row.oem), str(row.type), str(row.url))
+            )
+
+        scraped: dict[tuple[str, str], list[tuple[int, dict[str, Any]]]] = {}
+        ready: dict[tuple[str, str], dict[str, Any]] = {}
+
+        def _dealer_payload(dealer_id: str, dealer_name: str) -> dict[str, Any]:
+            entries = [
+                entry
+                for _, entry in sorted(
+                    scraped.get((dealer_id, dealer_name), []), key=lambda t: t[0]
+                )
+            ]
+            return {
+                "dealer_id": dealer_id,
+                "dealer_name": dealer_name,
+                "date_token": date_token,
+                "urls": entries,
+            }
+
+        if rows:
+            # De-duplicate scraping by URL: OEMs that share a URL are scraped once
+            # and reuse the same body, so identical URLs never diverge.
+            url_to_rows: dict[str, list[tuple[int, str, str, str, str, str]]] = {}
+            for row in rows:
+                url_to_rows.setdefault(row[5], []).append(row)
+
+            workers = max(1, min(settings.scraper_max_workers, len(url_to_rows)))
+            logfire.info(
+                "Scraping Sales Specials URLs concurrently",
+                url_count=len(rows),
+                unique_urls=len(url_to_rows),
+                max_workers=workers,
+            )
+
+            def _finish_url(url: str, body: str | None, scrape_error: str | None) -> None:
+                for index, d_id, d_name, oem, type_, _ in url_to_rows[url]:
+                    entry = {
+                        "oem": oem,
+                        "type": type_,
+                        "url": url,
+                        "body": body,
+                        "scrape_error": scrape_error,
+                    }
+                    key = (d_id, d_name)
+                    scraped.setdefault(key, []).append((index, entry))
+                    remaining[key] -= 1
+                    if remaining[key] == 0:
+                        # All of this dealer's URLs are scraped: emit it now so
+                        # stage C can extract while other dealers keep scraping.
+                        payload = _dealer_payload(*key)
+                        ready[key] = payload
+                        if on_dealer_ready is not None:
+                            logfire.info(
+                                "Dealer scraped; dispatching to extract",
+                                dealer_id=key[0],
+                                url_count=len(payload["urls"]),
+                            )
+                            on_dealer_ready(payload)
+
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [
+                    pool.submit(self._scrape_url, url) for url in url_to_rows
+                ]
+                for future in as_completed(futures):
+                    url, body, scrape_error = future.result()
+                    _finish_url(url, body, scrape_error)
+
+        payloads = [
+            ready.get(key) or _dealer_payload(*key) for key in dealer_order
+        ]
+        return str(excel_path), payloads
+
+    def _scrape_url(self, url: str) -> tuple[str, str | None, str | None]:
+        logfire.info("Scraping URL", url=url)
+        try:
+            return url, self.workflow.scrape(url), None
+        except Exception as exc:
+            logfire.error("Scrape failed for URL", url=url, error=str(exc))
+            return url, None, str(exc)
+
+    def build_dealer(self, payload: dict[str, Any]) -> DealerZipResult:
+        """Stage C: extract offers for one dealer, running the LLM sequentially over
+        that dealer's already-scraped URLs, then write the dealer zip + error file.
+
+        OEMs that share the same URL are extracted only once and reuse the same
+        offers, so identical URLs always yield an identical, complete offer set."""
+        dealer_id = payload["dealer_id"]
+        dealer_name = payload["dealer_name"]
+        date_token = payload["date_token"]
+        logfire.info(
+            "Extracting dealer offers",
+            dealer_id=dealer_id,
+            url_count=len(payload["urls"]),
+        )
+        # Cache extraction per URL so OEMs sharing a URL get the same offers.
+        cache: dict[str, tuple[list[Any], int] | Exception] = {}
+        results = [
+            self._extract_one(index, dealer_id, dealer_name, entry, date_token, cache)
+            for index, entry in enumerate(payload["urls"])
+        ]
+        return self._assemble_dealer(dealer_id, dealer_name, results, date_token)
+
+    def _extract_one(
+        self,
+        order: int,
+        dealer_id: str,
+        dealer_name: str,
+        entry: dict[str, Any],
+        date_token: str,
+        cache: dict[str, Any],
+    ) -> _UrlResult:
+        oem = entry["oem"]
+        url = entry["url"]
+        file_stem = f"{dealer_id}_{oem}_{date_token}"
+
+        scrape_error = entry.get("scrape_error")
+        if scrape_error:
+            return _UrlResult(
+                order=order,
+                dealer_id=dealer_id,
+                dealer_name=dealer_name,
+                oem=oem,
+                url=url,
+                count=0,
+                error_message=f"URL: {url}\nOEM: {oem}\nError: {scrape_error}",
+            )
+
+        # Extract once per URL; reuse the offers for other OEMs with the same URL.
+        cached = cache.get(url)
+        if cached is None:
+            try:
+                cached = self.workflow.incentives_from_body(entry["body"])
+            except Exception as exc:
+                logfire.error(
+                    "Offer extraction failed for URL",
+                    dealer_id=dealer_id,
+                    oem=oem,
+                    url=url,
+                    error=str(exc),
+                )
+                cached = exc
+            cache[url] = cached
+
+        if isinstance(cached, Exception):
+            return _UrlResult(
+                order=order,
+                dealer_id=dealer_id,
+                dealer_name=dealer_name,
+                oem=oem,
+                url=url,
+                count=0,
+                error_message=f"URL: {url}\nOEM: {oem}\nError: {cached}",
+            )
+
+        incentives, count = cached
+        if count > 0:
+            file_name, file_bytes = self.excel_service.build_workbook_bytes(
+                dealer_name=dealer_name,
+                incentives=incentives,
+                source_url=url,
+                file_stem=file_stem,
+            )
+            return _UrlResult(
+                order=order,
+                dealer_id=dealer_id,
+                dealer_name=dealer_name,
+                oem=oem,
+                url=url,
+                count=count,
+                file_name=file_name,
+                file_bytes=file_bytes,
+            )
+
+        logfire.warn(
+            "No offers extracted for URL",
+            dealer_id=dealer_id,
+            oem=oem,
+            url=url,
+        )
+        return _UrlResult(
+            order=order,
+            dealer_id=dealer_id,
+            dealer_name=dealer_name,
+            oem=oem,
+            url=url,
+            count=0,
+            error_message=(
+                f"URL: {url}\nOEM: {oem}\n"
+                "Error: No offers were extracted from this page."
+            ),
+        )
+
+    def _assemble_dealer(
+        self,
+        dealer_id: str,
+        dealer_name: str,
+        results: list[_UrlResult],
+        date_token: str,
+    ) -> DealerZipResult:
+        workbooks: list[tuple[str, bytes]] = []
+        offer_counts: dict[str, int] = {}
+        # Per-URL failures/empty results, combined into one dealer error .txt file.
+        error_sections: list[str] = []
+        errors: dict[str, str] = {}
+
+        for res in results:
+            offer_counts[res.oem] = res.count
+            if res.count > 0 and res.file_name and res.file_bytes is not None:
+                workbooks.append((res.file_name, res.file_bytes))
+            if res.error_message:
+                error_sections.append(res.error_message)
+                errors[res.oem] = res.error_message.splitlines()[-1].removeprefix(
+                    "Error: "
+                )
+
+        result = DealerZipResult(
+            dealer_id=dealer_id,
+            dealer_name=dealer_name,
+            excel_files=[name for name, _ in workbooks],
+            offer_counts=offer_counts,
+            errors=errors,
+        )
+
+        if workbooks:
+            zip_name, zip_path = self._write_zip(
+                f"{self._slugify(dealer_id)}_{self._slugify(dealer_name)}_{date_token}.zip",
+                workbooks,
+            )
+            result.zip_name = zip_name
+            result.zip_path = zip_path
+            logfire.info(
+                "Dealer zip created",
+                dealer_id=dealer_id,
+                zip_name=zip_name,
+                excel_count=len(workbooks),
+            )
+
+        if error_sections:
+            error_file_name, error_file_path = self._write_text(
+                f"error_{self._slugify(dealer_id)}_{self._slugify(dealer_name)}_{date_token}.txt",
+                ("\n\n" + "-" * 60 + "\n\n").join(error_sections),
+            )
+            result.error_file_name = error_file_name
+            result.error_file_path = error_file_path
+            logfire.info(
+                "Dealer error file created",
+                dealer_id=dealer_id,
+                error_file_name=error_file_name,
+                error_count=len(error_sections),
+            )
+
+        return result
+
+    def _write_zip(
+        self,
+        zip_name: str,
+        files: list[tuple[str, bytes]],
+    ) -> tuple[str, str]:
+        zip_path = self.storage_dir / zip_name
+        try:
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+                for file_name, file_bytes in files:
+                    archive.writestr(file_name, file_bytes)
+        except OSError as exc:
+            raise FileStorageError(
+                f"Failed to create zip {zip_name}: {exc}"
+            ) from exc
+        return zip_name, str(zip_path)
+
+    def _write_text(self, file_name: str, text: str) -> tuple[str, str]:
+        file_path = self.storage_dir / file_name
+        try:
+            file_path.write_text(text, encoding="utf-8")
+        except OSError as exc:
+            raise FileStorageError(
+                f"Failed to write file {file_name}: {exc}"
+            ) from exc
+        return file_name, str(file_path)

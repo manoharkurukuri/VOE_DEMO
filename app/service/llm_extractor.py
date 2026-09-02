@@ -1,0 +1,158 @@
+import queue
+from typing import Any
+
+import logfire
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+
+from app.core.config import settings
+from app.core.exceptions import LLMExtractionError
+from app.schemas.llm import OfferExtractionResponse
+
+
+
+SYSTEM_PROMPT = """
+You extract promotional SALES offers from an automobile dealer website's specials page.
+
+SALES specials are new-vehicle-arrival, used, lease, finance, and cash offers on a
+specific vehicle (year/make/model/trim, monthly payment, APR, due at signing, etc.).
+Extract only SALES offers into the schema below. Ignore service, parts, and
+maintenance coupons (oil changes, brake service, tires, batteries, alignments, wiper
+blades, detailing, multi-point inspections, and parts/accessory discounts); these are
+NOT offers for this task and must never be extracted.
+
+Return structured data matching the provided schema.
+
+Rules:
+1. Extract every DISTINCT sales offer you can find on the website.
+   A single offer is often repeated on the page: the hero banner, an offer card,
+   a "See details" modal, and the fine-print disclaimer can all describe the SAME
+   offer. Treat all of those as ONE offer, not several. Two offers are the same
+   when they describe the same vehicle (same year/make/model/trim, or same VIN or
+   stock number) with the same headline terms (same monthly payment, term, and
+   due-at-signing, or the same APR). Never output the same offer more than once.
+2. Return ALL distinct sales offers on the page. Do not cap or limit the number of
+   offers. Preserve the top-to-bottom order in which the offers appear on the website.
+3. Never invent a value. If the source does not explicitly provide it, return null.
+4. Offer Type must be one of:
+   - Lease Offer
+   - Combined Lease/APR Offer
+   - Bonus Cash Offer
+   - Buy For Offer
+   - Finance Offer
+   - Bonus Offer
+   - Conquest Offer
+5. If an offer is fundamentally a lease but contains conquest/loyalty eligibility,
+   keep Offer Type as Lease Offer. Use Conquest Offer only when the offer itself is
+   a standalone conquest incentive.
+6. If the SAME vehicle is advertised with more than one financing structure
+   (e.g. a lease payment AND an APR AND a bonus cash amount), return it as ONE
+   offer, not one offer per structure. When it explicitly includes both lease and
+   APR/finance terms, use Combined Lease/APR Offer. Only create separate offers
+   for genuinely different vehicles.
+7. Vehicle Type must be one of New, Used, CPO,
+   Loaner/Courtesy Vehicle/Nearly New, or null.
+8. For "due at lease signing" or equivalent, use Due at Signing and put the amount
+   in total_due_at_signing. Do not call it a down payment unless the source explicitly
+   says down payment/cash down.
+9. finance_rate is the APR percentage number, e.g. 1.9 for 1.9% APR.
+10. Do not calculate missing values. For example, do not sum incentives and call the
+    result Discount Towards MSRP unless the source explicitly identifies an MSRP discount.
+11. If multiple VINs belong to one offer, return them in vin_number as one comma-separated string.
+12. Every offer has its own disclaimer. Each vehicle typically has a separate
+    fine-print block, often starting with "Vehicle shown for illustration purposes
+    only" or "Closed-end lease available on a <vehicle>".
+    Copy that block verbatim into the disclaimer field for THAT offer. Match each
+    disclaimer to its offer by the vehicle name/VIN mentioned inside
+    the disclaimer. Never leave disclaimer null when a matching disclaimer exists on
+    the page, and never reuse one offer's disclaimer for a different offer. Do not
+    fabricate disclaimer language.
+13. offer_emphasis must be null for now.
+14. Do not treat navigation text, buttons, headings, financing links, or inventory
+    links as offers. Do not treat service/parts/maintenance coupons as offers.
+
+OUTPUT FORMAT:
+Return ONLY a single JSON object (no markdown, no prose) with this exact shape:
+{
+  "offers": [
+    {
+      "offer_priority": string | null,
+      "offer_type": "Lease Offer" | "Combined Lease/APR Offer" | "Bonus Cash Offer" | "Buy For Offer" | "Finance Offer" | "Bonus Offer" | "Conquest Offer" | null,
+      "offer_emphasis": null,
+      "vehicle_type": "New" | "Used" | "CPO" | "Loaner/Courtesy Vehicle/Nearly New" | null,
+      "year": integer | null,
+      "make": string | null,
+      "model": string | null,
+      "trim": string | null,
+      "drive_train": string | null,
+      "stock_number": string | null,
+      "vin_number": string | null,
+      "msrp": number | null,
+      "lowest_monthly_payment": number | null,
+      "lease_term_months": integer | null,
+      "down_payment_or_due_at_signing": "Down Payment" | "Due at Signing" | null,
+      "down_payment": number | null,
+      "total_due_at_signing": number | null,
+      "annual_mileage": integer | null,
+      "finance_rate": number | null,
+      "finance_term_months": integer | null,
+      "discount_towards_msrp": number | null,
+      "buy_for_price": number | null,
+      "selling_price": number | null,
+      "disclaimer": string | null,
+      "additional_creative_needs": string | null,
+      "impel_model_movers": string | null
+    }
+  ]
+}
+Every field must be present on each offer; use null when the source does not
+explicitly provide a value. Numbers must be plain JSON numbers with no "$", ","
+or "%". Return every distinct sales offer on the page.
+""".strip()
+
+
+class LLMOfferExtractor:
+    """Sends scraped page text to the LLM and returns structured sales offers.
+
+    Holds one structured client per API key. Each ``extract`` call checks a client
+    out of the pool and returns it when done, so up to ``len(keys)`` extractions
+    run in parallel, each on a distinct key, without exceeding one key's limit.
+    """
+
+    def __init__(self) -> None:
+        keys = settings.resolved_api_keys()
+        if not keys:
+            raise LLMExtractionError("No Gemini API key configured.")
+
+        self._pool: "queue.Queue[Any]" = queue.Queue()
+        for key in keys:
+            llm = ChatOpenAI(
+                model=settings.gemini_model,
+                api_key=key,
+                base_url=settings.gemini_base_url,
+                timeout=settings.gemini_timeout_seconds,
+                max_retries=settings.gemini_max_retries,
+                max_tokens=settings.gemini_max_tokens,
+                temperature=0,
+            )
+            self._pool.put(llm.with_structured_output(OfferExtractionResponse))
+        self.key_count = len(keys)
+
+    def extract(self, body: str) -> OfferExtractionResponse:
+        truncated = body[: settings.max_body_chars]
+        messages = [
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=truncated),
+        ]
+        structured = self._pool.get()
+        try:
+            result = structured.invoke(messages)
+        except Exception as exc:
+            logfire.error("LLM structured extraction failed", error=str(exc))
+            raise LLMExtractionError(f"LLM extraction failed: {exc}") from exc
+        finally:
+            self._pool.put(structured)
+
+        if not isinstance(result, OfferExtractionResponse):
+            raise LLMExtractionError("LLM returned no structured offer output.")
+        return result
