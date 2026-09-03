@@ -6,7 +6,6 @@ uvicorn
 pydantic
 pydantic-ai
 pydantic-settings
-logfire
 beautifulsoup4>=4.12
 langgraph>=1.0
 langchain-core>=1.0

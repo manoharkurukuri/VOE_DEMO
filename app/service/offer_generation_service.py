@@ -8,17 +8,19 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-import logfire
 import pandas as pd
 
 from app.core.config import settings
 from app.core.exceptions import FileStorageError
+from app.core.logger import get_logger
 from app.schemas.offer import DealerZipResult, GenerateOffersResult
 from app.service.excel_service import ExcelService
 from app.workflows.offer_generation_graph import OfferGenerationWorkflow
 
 SALES_SPECIALS_TYPE = "Sales Specials"
 REQUIRED_COLUMNS = {"id", "DealerName", "oem", "type", "url"}
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -80,6 +82,7 @@ class OfferGenerationService:
         self,
         excel_path: str | Path,
         on_dealer_ready: Callable[[dict[str, Any]], None] | None = None,
+        on_dealers_enumerated: Callable[[int], None] | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
         """Stage B: read the workbook, scrape every Sales Specials URL in parallel,
         and return one scraped-data payload per dealer (id, name, per-URL bodies).
@@ -87,6 +90,10 @@ class OfferGenerationService:
         If ``on_dealer_ready`` is given, it is called with a dealer's payload the
         moment that dealer's URLs finish scraping, so extraction (stage C) can start
         while the remaining dealers are still being scraped.
+
+        ``on_dealers_enumerated`` is called with the total dealer count as soon as
+        the workbook is parsed (before scraping), so callers can track run progress
+        without waiting for all scraping to finish.
         """
         excel_path = Path(excel_path)
         df = pd.read_excel(excel_path)
@@ -98,11 +105,11 @@ class OfferGenerationService:
             )
 
         sales_specials = df[df["type"] == SALES_SPECIALS_TYPE]
-        logfire.info(
-            "Filtered Sales Specials rows",
-            source_file=str(excel_path),
-            total_rows=len(df),
-            sales_specials_rows=len(sales_specials),
+        logger.info(
+            "Filtered Sales Specials rows | source_file=%s | total_rows=%d | sales_specials_rows=%d",
+            str(excel_path),
+            len(df),
+            len(sales_specials),
         )
 
         self.storage_dir.mkdir(parents=True, exist_ok=True)
@@ -122,6 +129,9 @@ class OfferGenerationService:
             rows.append(
                 (index, dealer_id, dealer_name, str(row.oem), str(row.type), str(row.url))
             )
+
+        if on_dealers_enumerated is not None:
+            on_dealers_enumerated(len(dealer_order))
 
         scraped: dict[tuple[str, str], list[tuple[int, dict[str, Any]]]] = {}
         ready: dict[tuple[str, str], dict[str, Any]] = {}
@@ -148,11 +158,11 @@ class OfferGenerationService:
                 url_to_rows.setdefault(row[5], []).append(row)
 
             workers = max(1, min(settings.scraper_max_workers, len(url_to_rows)))
-            logfire.info(
-                "Scraping Sales Specials URLs concurrently",
-                url_count=len(rows),
-                unique_urls=len(url_to_rows),
-                max_workers=workers,
+            logger.info(
+                "Scraping Sales Specials URLs concurrently | url_count=%d | unique_urls=%d | max_workers=%d",
+                len(rows),
+                len(url_to_rows),
+                workers,
             )
 
             def _finish_url(url: str, body: str | None, scrape_error: str | None) -> None:
@@ -173,10 +183,10 @@ class OfferGenerationService:
                         payload = _dealer_payload(*key)
                         ready[key] = payload
                         if on_dealer_ready is not None:
-                            logfire.info(
-                                "Dealer scraped; dispatching to extract",
-                                dealer_id=key[0],
-                                url_count=len(payload["urls"]),
+                            logger.info(
+                                "Dealer scraped; dispatching to extract | dealer_id=%s | url_count=%d",
+                                key[0],
+                                len(payload["urls"]),
                             )
                             on_dealer_ready(payload)
 
@@ -194,11 +204,11 @@ class OfferGenerationService:
         return str(excel_path), payloads
 
     def _scrape_url(self, url: str) -> tuple[str, str | None, str | None]:
-        logfire.info("Scraping URL", url=url)
+        logger.info("Scraping URL | url=%s", url)
         try:
             return url, self.workflow.scrape(url), None
         except Exception as exc:
-            logfire.error("Scrape failed for URL", url=url, error=str(exc))
+            logger.error("Scrape failed for URL | url=%s | error=%s", url, str(exc))
             return url, None, str(exc)
 
     def build_dealer(self, payload: dict[str, Any]) -> DealerZipResult:
@@ -210,10 +220,10 @@ class OfferGenerationService:
         dealer_id = payload["dealer_id"]
         dealer_name = payload["dealer_name"]
         date_token = payload["date_token"]
-        logfire.info(
-            "Extracting dealer offers",
-            dealer_id=dealer_id,
-            url_count=len(payload["urls"]),
+        logger.info(
+            "Extracting dealer offers | dealer_id=%s | url_count=%d",
+            dealer_id,
+            len(payload["urls"]),
         )
         # Cache extraction per URL so OEMs sharing a URL get the same offers.
         cache: dict[str, tuple[list[Any], int] | Exception] = {}
@@ -254,12 +264,12 @@ class OfferGenerationService:
             try:
                 cached = self.workflow.incentives_from_body(entry["body"])
             except Exception as exc:
-                logfire.error(
-                    "Offer extraction failed for URL",
-                    dealer_id=dealer_id,
-                    oem=oem,
-                    url=url,
-                    error=str(exc),
+                logger.error(
+                    "Offer extraction failed for URL | dealer_id=%s | oem=%s | url=%s | error=%s",
+                    dealer_id,
+                    oem,
+                    url,
+                    str(exc),
                 )
                 cached = exc
             cache[url] = cached
@@ -294,11 +304,11 @@ class OfferGenerationService:
                 file_bytes=file_bytes,
             )
 
-        logfire.warn(
-            "No offers extracted for URL",
-            dealer_id=dealer_id,
-            oem=oem,
-            url=url,
+        logger.warning(
+            "No offers extracted for URL | dealer_id=%s | oem=%s | url=%s",
+            dealer_id,
+            oem,
+            url,
         )
         return _UrlResult(
             order=order,
@@ -351,11 +361,11 @@ class OfferGenerationService:
             )
             result.zip_name = zip_name
             result.zip_path = zip_path
-            logfire.info(
-                "Dealer zip created",
-                dealer_id=dealer_id,
-                zip_name=zip_name,
-                excel_count=len(workbooks),
+            logger.info(
+                "Dealer zip created | dealer_id=%s | zip_name=%s | excel_count=%d",
+                dealer_id,
+                zip_name,
+                len(workbooks),
             )
 
         if error_sections:
@@ -365,11 +375,11 @@ class OfferGenerationService:
             )
             result.error_file_name = error_file_name
             result.error_file_path = error_file_path
-            logfire.info(
-                "Dealer error file created",
-                dealer_id=dealer_id,
-                error_file_name=error_file_name,
-                error_count=len(error_sections),
+            logger.info(
+                "Dealer error file created | dealer_id=%s | error_file_name=%s | error_count=%d",
+                dealer_id,
+                error_file_name,
+                len(error_sections),
             )
 
         return result

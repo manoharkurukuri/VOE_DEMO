@@ -1,8 +1,10 @@
-import logfire
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.core.exceptions import AppException
+from app.core.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 def register_exception_handlers(app: FastAPI) -> None:
@@ -10,11 +12,11 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def handle_app_exception(
         request: Request, exc: AppException
     ) -> JSONResponse:
-        logfire.error(
-            "Application error",
-            error_code=exc.code,
-            error_message=exc.message,
-            path=request.url.path,
+        logger.error(
+            "Application error | error_code=%s | error_message=%s | path=%s",
+            exc.code,
+            exc.message,
+            request.url.path,
         )
         return JSONResponse(
             status_code=exc.status_code,
@@ -30,10 +32,10 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def handle_unexpected_exception(
         request: Request, exc: Exception
     ) -> JSONResponse:
-        logfire.exception(
-            "Unhandled application exception",
-            path=request.url.path,
-            error=str(exc),
+        logger.exception(
+            "Unhandled application exception | path=%s | error=%s",
+            request.url.path,
+            str(exc),
         )
         return JSONResponse(
             status_code=500,

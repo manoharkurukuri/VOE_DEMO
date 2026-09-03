@@ -3,12 +3,13 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
-import logfire
-
 from app.core.config import settings
+from app.core.logger import get_logger
 
 Event = dict[str, Any]
 Handler = Callable[[Event], None]
+
+logger = get_logger(__name__)
 
 # Sentinel pushed onto the queue to unblock the worker(s) during shutdown.
 _STOP = object()
@@ -36,7 +37,7 @@ class InMemoryBroker:
 
     def publish(self, event: Event) -> None:
         self._queue.put(event)
-        logfire.info("Event published", broker=self.name)
+        logger.info("Event published | broker=%s", self.name)
 
     def start(self) -> None:
         if self._threads and any(t.is_alive() for t in self._threads):
@@ -62,16 +63,16 @@ class InMemoryBroker:
                 if event is _STOP:
                     return
                 if self._handler is None:
-                    logfire.warn(
-                        "No subscriber registered; event dropped", broker=self.name
+                    logger.warning(
+                        "No subscriber registered; event dropped | broker=%s", self.name
                     )
                     continue
                 self._handler(event)
             except Exception as exc:
-                logfire.error(
-                    "Subscriber failed to process event",
-                    broker=self.name,
-                    error=str(exc),
+                logger.error(
+                    "Subscriber failed to process event | broker=%s | error=%s",
+                    self.name,
+                    str(exc),
                 )
             finally:
                 self._queue.task_done()

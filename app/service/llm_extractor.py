@@ -1,13 +1,15 @@
 import queue
 from typing import Any
 
-import logfire
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from app.core.config import settings
 from app.core.exceptions import LLMExtractionError
+from app.core.logger import get_logger
 from app.schemas.llm import OfferExtractionResponse
+
+logger = get_logger(__name__)
 
 
 
@@ -148,7 +150,7 @@ class LLMOfferExtractor:
         try:
             result = structured.invoke(messages)
         except Exception as exc:
-            logfire.error("LLM structured extraction failed", error=str(exc))
+            logger.error("LLM structured extraction failed | error=%s", str(exc))
             raise LLMExtractionError(f"LLM extraction failed: {exc}") from exc
         finally:
             self._pool.put(structured)

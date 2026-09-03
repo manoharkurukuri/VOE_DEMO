@@ -1,13 +1,15 @@
 from typing import Any
 
-import logfire
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
+from app.core.logger import get_logger
 from app.schemas.llm import OfferExtractionResponse, VehicleIncentiveLLM
 from app.service.excel_service import ExcelService
 from app.service.llm_extractor import LLMOfferExtractor
 from app.service.scraper import get_website_content_from_url
+
+logger = get_logger(__name__)
 
 
 class OfferWorkflowState(TypedDict, total=False):
@@ -49,10 +51,10 @@ class OfferGenerationWorkflow:
     def _scrape_website(state: OfferWorkflowState) -> dict[str, Any]:
         content = get_website_content_from_url(state["url"])
         body = content["body"]
-        logfire.info(
-            "Extracted body from HTML content",
-            url=state["url"],
-            body_char_count=len(body),
+        logger.info(
+            "Extracted body from HTML content | url=%s | body_char_count=%d",
+            state["url"],
+            len(body),
         )
         return {
             "body": body,
@@ -60,18 +62,18 @@ class OfferGenerationWorkflow:
         }
 
     def _extract_with_llm(self, state: OfferWorkflowState) -> dict[str, Any]:
-        logfire.info(
-            "Sending body to LLM for offer extraction",
-            body_char_count=len(state["body"]),
+        logger.info(
+            "Sending body to LLM for offer extraction | body_char_count=%d",
+            len(state["body"]),
         )
         try:
             extraction = self.llm_extractor.extract(state["body"])
         except Exception as exc:
-            logfire.error("LLM failed to generate offer response", error=str(exc))
+            logger.error("LLM failed to generate offer response | error=%s", str(exc))
             raise
-        logfire.info(
-            "LLM successfully generated offer response",
-            offer_count=len(extraction.offers),
+        logger.info(
+            "LLM successfully generated offer response | offer_count=%d",
+            len(extraction.offers),
         )
         return {"extraction": extraction}
 
@@ -142,10 +144,10 @@ class OfferGenerationWorkflow:
                 )
             )
 
-        logfire.info(
-            "Offers normalized",
-            offer_count=len(normalized),
-            duplicates_removed=duplicate_count,
+        logger.info(
+            "Offers normalized | offer_count=%d | duplicates_removed=%d",
+            len(normalized),
+            duplicate_count,
         )
         return {
             "incentives": normalized,

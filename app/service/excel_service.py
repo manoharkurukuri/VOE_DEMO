@@ -5,7 +5,6 @@ from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import logfire
 from openpyxl import Workbook
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.comments import Comment
@@ -22,7 +21,10 @@ from app.core.constants import (
     VEHICLE_TYPE_OPTIONS,
 )
 from app.core.exceptions import ExcelGenerationError
+from app.core.logger import get_logger
 from app.schemas.llm import VehicleIncentiveLLM
+
+logger = get_logger(__name__)
 
 
 class ExcelService:
@@ -194,10 +196,7 @@ class ExcelService:
 
             buffer = io.BytesIO()
             workbook.save(buffer)
-            logfire.info(
-                "Workbook generated in memory",
-                file_name=file_name,
-            )
+            logger.info("Workbook generated in memory | file_name=%s", file_name)
             return file_name, buffer.getvalue()
         except Exception as exc:
             raise ExcelGenerationError(

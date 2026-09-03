@@ -1,9 +1,9 @@
-import logfire
 from fastapi import FastAPI, Request
 from contextlib import asynccontextmanager
 from fastapi.responses import JSONResponse
 from app.core.exceptions import AppException
 from app.core.config import settings  
+from app.core.logger import get_logger
 from app.core.exception_handlers import register_exception_handlers
 from app.api.offers import router as offers_router
 from app.events.broker import extract_broker, scrape_broker
@@ -12,12 +12,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-logfire.configure(
-    service_name=settings.app_name,
-    environment=settings.app_env,
-    send_to_logfire="if-token-present",
-)
-logfire.instrument_pydantic(record="failure")
+logger = get_logger(__name__)
 
 
 @asynccontextmanager
@@ -42,11 +37,7 @@ app.include_router(offers_router)
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    logfire.info(
-        "Incoming request",
-        method=request.method,
-        path=request.url.path,
-    )
+    logger.info("Incoming request | method=%s | path=%s", request.method, request.url.path)
     return await call_next(request)
 
 @app.get("/health", tags=["health"])
