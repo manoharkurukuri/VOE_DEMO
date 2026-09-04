@@ -1,11 +1,13 @@
 # Environment
 .env
 .env.*
+!.env.example
 
 # Storage
 storage/
 
 venv/
+.venv/
 
 __pycache__/
 *.pyc

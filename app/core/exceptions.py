@@ -35,3 +35,20 @@ class FileStorageError(AppException):
 class ConfigurationError(AppException):
     status_code = 500
     code = "configuration_error"
+
+
+class UnsupportedOfferTypeError(AppException):
+    status_code = 400
+    code = "unsupported_offer_type"
+
+
+class OfferRunInProgressError(AppException):
+    status_code = 409
+    code = "offer_run_in_progress"
+
+    def __init__(self, running_offer_type: str) -> None:
+        self.running_offer_type = running_offer_type
+        super().__init__(
+            f"An offer-generation run for '{running_offer_type}' is currently "
+            f"running. Please wait until it completes before starting another."
+        )
