@@ -35,7 +35,25 @@ class Settings(BaseSettings):
     # dealer's URLs go to the LLM sequentially, so keep this near the API-key
     # count so concurrent dealers each get their own key.
     dealer_extract_workers: int = 5
-    
+
+    # Default input workbook used when a caller omits the path (CLI/scheduler).
+    default_excel_path: str = "offers/MWK00012GMC_Dealership_URLs.xlsx"
+
+    # --- Scheduler (APScheduler, in-process) -------------------------------
+    # Off by default; enable to run per-type cron jobs inside the API process.
+    scheduler_enabled: bool = False
+    # Per-type cron expressions (minute hour day month day_of_week). Each type
+    # runs once a month on the 5th, staggered to a different hour so they don't
+    # all fire at once. Override any of them via env, e.g.
+    # SCHEDULE_SALES_SPECIALS="30 1 5 * *".
+    schedule_sales_specials: str = "0 1 5 * *"
+    schedule_service_specials: str = "0 2 5 * *"
+    schedule_schedule_service: str = "0 3 5 * *"
+    schedule_new_inventory: str = "0 4 5 * *"
+    schedule_certified_inventory: str = "0 5 5 * *"
+    schedule_used_inventory: str = "0 6 5 * *"
+    schedule_offer_to_purchase: str = "0 7 5 * *"
+
 
     model_config = SettingsConfigDict(
         env_file=".env",

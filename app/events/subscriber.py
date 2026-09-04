@@ -3,21 +3,12 @@ import time
 from datetime import datetime
 from typing import Any
 
+from app.config.type_registry import get_processor
 from app.core.logger import get_logger
 from app.events.broker import extract_broker
-from app.service.offer_generation_service import OfferGenerationService
+from app.events.run_lock import run_lock
 
 logger = get_logger(__name__)
-
-# Reuse one service (LLM client pool + compiled graph) across events.
-_service: OfferGenerationService | None = None
-
-
-def _get_service() -> OfferGenerationService:
-    global _service
-    if _service is None:
-        _service = OfferGenerationService()
-    return _service
 
 
 class _RunTracker:
@@ -75,43 +66,72 @@ class _RunTracker:
             duration,
             self._completed,
         )
+        # Run is fully complete: free the global lock so the next request/run
+        # can start.
+        run_lock.release()
 
 
 _run_tracker = _RunTracker()
 
 
 def handle_scrape_event(event: dict[str, Any]) -> None:
-    """Stage B subscriber: scrape every dealer's Sales Specials URLs and publish
-    each dealer to the extract broker (stage C) as soon as that dealer's URLs
-    finish scraping, so extraction overlaps with the remaining scraping."""
+    """Stage B subscriber: resolve the processor for the event's offer type,
+    scrape every matching URL, and publish each dealer to the extract broker
+    (stage C) as soon as that dealer's URLs finish scraping, so extraction
+    overlaps with the remaining scraping."""
     excel_path = event["excel_path"]
-    logger.info("Scraping dealer URLs | excel_path=%s", excel_path)
-
-    _run_tracker.start()
-    source_file, payloads = _get_service().scrape_dealers(
+    offer_type = event.get("offer_type")
+    processor = get_processor(offer_type)
+    logger.info(
+        "[%s] Scraping dealer URLs | excel_path=%s",
+        processor.offer_type.value,
         excel_path,
-        on_dealer_ready=extract_broker.publish,
-        on_dealers_enumerated=_run_tracker.set_expected,
     )
 
+    _run_tracker.start()
+    try:
+        source_file, payloads = processor.scrape(
+            excel_path,
+            on_dealer_ready=extract_broker.publish,
+            on_dealers_enumerated=_run_tracker.set_expected,
+        )
+    except Exception:
+        # Scraping failed before any dealer was dispatched to extract, so the
+        # run tracker will never finalize; release the lock here so the API
+        # isn't stuck reporting a run in progress.
+        logger.exception(
+            "[%s] Scraping stage failed | excel_path=%s",
+            processor.offer_type.value,
+            excel_path,
+        )
+        run_lock.release()
+        raise
+
     logger.info(
-        "Scraping stage completed; all dealers dispatched to extract | "
+        "[%s] Scraping stage completed; all dealers dispatched to extract | "
         "source_file=%s | dealer_count=%d",
+        processor.offer_type.value,
         source_file,
         len(payloads),
     )
 
 
 def handle_extract_event(event: dict[str, Any]) -> None:
-    """Stage C subscriber: extract offers for one dealer (LLM sequential per dealer)
-    and write the dealer's Excel zip + error file."""
+    """Stage C subscriber: resolve the processor from the payload's offer type,
+    extract for one dealer, and write that dealer's output + error file."""
     dealer_id = event.get("dealer_id")
-    logger.info("Extracting offers for dealer | dealer_id=%s", dealer_id)
+    processor = get_processor(event.get("offer_type"))
+    logger.info(
+        "[%s] Extracting offers for dealer | dealer_id=%s",
+        processor.offer_type.value,
+        dealer_id,
+    )
 
     try:
-        result = _get_service().build_dealer(event)
+        result = processor.build_dealer(event)
         logger.info(
-            "Dealer extraction completed | dealer_id=%s | zip_name=%s | error_file_name=%s",
+            "[%s] Dealer extraction completed | dealer_id=%s | zip_name=%s | error_file_name=%s",
+            processor.offer_type.value,
             result.dealer_id,
             result.zip_name,
             result.error_file_name,

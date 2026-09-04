@@ -10,14 +10,21 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from app.config.offer_types import (
+    DEFAULT_OFFER_TYPE,
+    IGNORED_EXCEL_TYPES,
+    OfferType,
+    excel_label,
+    normalize_offer_type,
+)
 from app.core.config import settings
 from app.core.exceptions import FileStorageError
 from app.core.logger import get_logger
 from app.schemas.offer import DealerZipResult, GenerateOffersResult
 from app.service.excel_service import ExcelService
+from app.utils.output_paths import get_error_directory, get_zip_directory
 from app.workflows.offer_generation_graph import OfferGenerationWorkflow
 
-SALES_SPECIALS_TYPE = "Sales Specials"
 REQUIRED_COLUMNS = {"id", "DealerName", "oem", "type", "url"}
 
 logger = get_logger(__name__)
@@ -57,10 +64,15 @@ class OfferGenerationService:
     def _date_token(self) -> str:
         return datetime.now(ZoneInfo(self.timezone_name)).strftime("%Y%m%d")
 
-    def generate_from_excel(self, excel_path: str | Path) -> GenerateOffersResult:
+    def generate_from_excel(
+        self,
+        excel_path: str | Path,
+        offer_type: str | OfferType = DEFAULT_OFFER_TYPE,
+    ) -> GenerateOffersResult:
         """Synchronous end-to-end run (used by the CLI): scrape every dealer URL,
         then extract + zip each dealer, dealers processed in parallel."""
-        source_file, payloads = self.scrape_dealers(excel_path)
+        resolved = normalize_offer_type(offer_type)
+        source_file, payloads = self.scrape_dealers(excel_path, offer_type=resolved)
 
         dealers: list[DealerZipResult | None] = [None] * len(payloads)
         if payloads:
@@ -81,11 +93,13 @@ class OfferGenerationService:
     def scrape_dealers(
         self,
         excel_path: str | Path,
+        offer_type: str | OfferType = DEFAULT_OFFER_TYPE,
         on_dealer_ready: Callable[[dict[str, Any]], None] | None = None,
         on_dealers_enumerated: Callable[[int], None] | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
-        """Stage B: read the workbook, scrape every Sales Specials URL in parallel,
-        and return one scraped-data payload per dealer (id, name, per-URL bodies).
+        """Stage B: read the workbook, scrape every URL for ``offer_type`` in
+        parallel, and return one scraped-data payload per dealer (id, name,
+        per-URL bodies).
 
         If ``on_dealer_ready`` is given, it is called with a dealer's payload the
         moment that dealer's URLs finish scraping, so extraction (stage C) can start
@@ -95,6 +109,9 @@ class OfferGenerationService:
         the workbook is parsed (before scraping), so callers can track run progress
         without waiting for all scraping to finish.
         """
+        resolved = normalize_offer_type(offer_type)
+        target_label = excel_label(resolved)
+        log_prefix = f"[{resolved.value}]"
         excel_path = Path(excel_path)
         df = pd.read_excel(excel_path)
 
@@ -104,12 +121,30 @@ class OfferGenerationService:
                 f"Input workbook is missing required columns: {sorted(missing)}"
             )
 
-        sales_specials = df[df["type"] == SALES_SPECIALS_TYPE]
+        type_series = df["type"].astype(str)
+        matching = df[type_series.str.strip().str.casefold() == target_label.casefold()]
+
+        # Log any rows we intentionally skip (unsupported/ignored types) so a
+        # workbook with mixed rows never fails the job silently.
+        skipped = type_series[
+            type_series.str.strip().str.casefold() != target_label.casefold()
+        ]
+        ignored_rows = skipped[
+            skipped.str.strip().str.casefold().isin(IGNORED_EXCEL_TYPES)
+        ]
+        if len(skipped) > 0:
+            logger.info(
+                "%s Skipping non-matching rows | skipped_rows=%d | ignored_rows=%d",
+                log_prefix,
+                len(skipped),
+                len(ignored_rows),
+            )
         logger.info(
-            "Filtered Sales Specials rows | source_file=%s | total_rows=%d | sales_specials_rows=%d",
+            "%s Filtered rows | source_file=%s | total_rows=%d | matching_rows=%d",
+            log_prefix,
             str(excel_path),
             len(df),
-            len(sales_specials),
+            len(matching),
         )
 
         self.storage_dir.mkdir(parents=True, exist_ok=True)
@@ -118,7 +153,7 @@ class OfferGenerationService:
         rows: list[tuple[int, str, str, str, str, str]] = []
         dealer_order: list[tuple[str, str]] = []
         remaining: dict[tuple[str, str], int] = {}
-        for index, row in enumerate(sales_specials.itertuples(index=False)):
+        for index, row in enumerate(matching.itertuples(index=False)):
             dealer_id = str(row.id)
             dealer_name = str(row.DealerName)
             key = (dealer_id, dealer_name)
@@ -147,6 +182,7 @@ class OfferGenerationService:
                 "dealer_id": dealer_id,
                 "dealer_name": dealer_name,
                 "date_token": date_token,
+                "offer_type": resolved.value,
                 "urls": entries,
             }
 
@@ -220,8 +256,10 @@ class OfferGenerationService:
         dealer_id = payload["dealer_id"]
         dealer_name = payload["dealer_name"]
         date_token = payload["date_token"]
+        offer_type = normalize_offer_type(payload.get("offer_type"))
         logger.info(
-            "Extracting dealer offers | dealer_id=%s | url_count=%d",
+            "[%s] Extracting dealer offers | dealer_id=%s | url_count=%d",
+            offer_type.value,
             dealer_id,
             len(payload["urls"]),
         )
@@ -231,7 +269,9 @@ class OfferGenerationService:
             self._extract_one(index, dealer_id, dealer_name, entry, date_token, cache)
             for index, entry in enumerate(payload["urls"])
         ]
-        return self._assemble_dealer(dealer_id, dealer_name, results, date_token)
+        return self._assemble_dealer(
+            dealer_id, dealer_name, results, date_token, offer_type
+        )
 
     def _extract_one(
         self,
@@ -329,6 +369,7 @@ class OfferGenerationService:
         dealer_name: str,
         results: list[_UrlResult],
         date_token: str,
+        offer_type: OfferType = DEFAULT_OFFER_TYPE,
     ) -> DealerZipResult:
         workbooks: list[tuple[str, bytes]] = []
         offer_counts: dict[str, int] = {}
@@ -354,15 +395,20 @@ class OfferGenerationService:
             errors=errors,
         )
 
+        zip_dir = get_zip_directory(offer_type)
+        error_dir = get_error_directory(offer_type)
+
         if workbooks:
             zip_name, zip_path = self._write_zip(
+                zip_dir,
                 f"{self._slugify(dealer_id)}_{self._slugify(dealer_name)}_{date_token}.zip",
                 workbooks,
             )
             result.zip_name = zip_name
             result.zip_path = zip_path
             logger.info(
-                "Dealer zip created | dealer_id=%s | zip_name=%s | excel_count=%d",
+                "[%s] Dealer zip created | dealer_id=%s | zip_name=%s | excel_count=%d",
+                offer_type.value,
                 dealer_id,
                 zip_name,
                 len(workbooks),
@@ -370,13 +416,15 @@ class OfferGenerationService:
 
         if error_sections:
             error_file_name, error_file_path = self._write_text(
+                error_dir,
                 f"error_{self._slugify(dealer_id)}_{self._slugify(dealer_name)}_{date_token}.txt",
                 ("\n\n" + "-" * 60 + "\n\n").join(error_sections),
             )
             result.error_file_name = error_file_name
             result.error_file_path = error_file_path
             logger.info(
-                "Dealer error file created | dealer_id=%s | error_file_name=%s | error_count=%d",
+                "[%s] Dealer error file created | dealer_id=%s | error_file_name=%s | error_count=%d",
+                offer_type.value,
                 dealer_id,
                 error_file_name,
                 len(error_sections),
@@ -386,10 +434,12 @@ class OfferGenerationService:
 
     def _write_zip(
         self,
+        directory: Path,
         zip_name: str,
         files: list[tuple[str, bytes]],
     ) -> tuple[str, str]:
-        zip_path = self.storage_dir / zip_name
+        directory.mkdir(parents=True, exist_ok=True)
+        zip_path = directory / zip_name
         try:
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
                 for file_name, file_bytes in files:
@@ -400,8 +450,11 @@ class OfferGenerationService:
             ) from exc
         return zip_name, str(zip_path)
 
-    def _write_text(self, file_name: str, text: str) -> tuple[str, str]:
-        file_path = self.storage_dir / file_name
+    def _write_text(
+        self, directory: Path, file_name: str, text: str
+    ) -> tuple[str, str]:
+        directory.mkdir(parents=True, exist_ok=True)
+        file_path = directory / file_name
         try:
             file_path.write_text(text, encoding="utf-8")
         except OSError as exc:
